@@ -1,0 +1,1180 @@
+#include "Hooks.h"
+#include "Client.h"
+#include "../utils/Logger.h"
+#include "../menu/Theme.h"
+
+#include <MinHook.h>
+#include <gl/GL.h>
+#include "imgui.h"
+#include "imgui_impl_opengl3.h"
+#include "imgui_impl_win32.h"
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
+    HWND, UINT, WPARAM, LPARAM);
+
+Hooks& Hooks::instance()
+{
+    static Hooks inst;
+    return inst;
+}
+
+// ════════════════════════════════════════════════════════════
+//  Init — called from the background init thread.
+//  Sets up the MinHook on wglSwapBuffers so that every
+//  subsequent frame hits our hook.
+// ════════════════════════════════════════════════════════════
+bool Hooks::init()
+{
+    m_opengl32 = GetModuleHandleA("opengl32.dll");
+    if (!m_opengl32)
+    {
+        OutputDebugStringA("ytclient: opengl32.dll not loaded\n");
+        return false;
+    }
+
+    void* target = (void*)GetProcAddress(m_opengl32, "wglSwapBuffers");
+    if (!target)
+    {
+        OutputDebugStringA("ytclient: wglSwapBuffers not found\n");
+        return false;
+    }
+
+    MH_STATUS s = MH_Initialize();
+    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "ytclient: MH_Initialize failed: %d\n", s);
+        OutputDebugStringA(buf);
+        return false;
+    }
+
+    s = MH_CreateHook(target, (void*)&hkSwapBuffers, &m_origSwap);
+    if (s != MH_OK)
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "ytclient: MH_CreateHook failed: %d\n", s);
+        OutputDebugStringA(buf);
+        return false;
+    }
+
+    s = MH_EnableHook(target);
+    if (s != MH_OK)
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "ytclient: MH_EnableHook failed: %d\n", s);
+        OutputDebugStringA(buf);
+        return false;
+    }
+
+    m_hookOK = true;
+    OutputDebugStringA("ytclient: wglSwapBuffers hooked\n");
+    return true;
+}
+
+void Hooks::shutdown()
+{
+    if (!m_hookOK) return;
+
+    void* target = (void*)GetProcAddress(m_opengl32, "wglSwapBuffers");
+    if (target) MH_DisableHook(target);
+    MH_Uninitialize();
+    m_hookOK = false;
+
+    if (m_imguiInit)
+    {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        m_imguiInit = false;
+    }
+
+    // Restore WndProc
+    if (m_origWndProc && m_hwnd)
+    {
+        SetWindowLongPtr(m_hwnd, GWLP_WNDPROC, (LONG_PTR)m_origWndProc);
+    }
+
+    OutputDebugStringA("ytclient: shutdown\n");
+}
+
+// ════════════════════════════════════════════════════════════
+//  ImGui init — runs on the RENDER THREAD inside hkSwapBuffers.
+//  The OpenGL context is guaranteed to be current here.
+// ════════════════════════════════════════════════════════════
+void Hooks::initImGui(HDC hdc)
+{
+    // Safety: we must have a valid GL context
+    if (!wglGetCurrentContext())
+    {
+        OutputDebugStringA("ytclient: initImGui: no GL context, will retry\n");
+        return;  // m_imguiInit stays false, hkSwapBuffers will retry
+    }
+
+    OutputDebugStringA("ytclient: initImGui starting\n");
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = nullptr;  // don't write imgui.ini
+
+    // Font loading (best-effort, falls back to default)
+    io.Fonts->Clear();
+    io.Fonts->AddFontDefault();
+    ImFont* font = io.Fonts->AddFontFromFileTTF(
+        "C:\\Windows\\Fonts\\segoeui.ttf", 15.0f);
+    if (font)
+    {
+        io.FontDefault = font;
+        io.Fonts->Build();
+    }
+    else
+    {
+        // Default font is already loaded
+        io.Fonts->Build();
+    }
+
+    Theme::apply();
+
+    // Get the game window from the DC
+    m_hwnd = WindowFromDC(hdc);
+
+    // Validate the window handle
+    if (!m_hwnd || m_hwnd == GetDesktopWindow())
+    {
+        OutputDebugStringA("ytclient: initImGui: invalid HWND\n");
+        m_imguiFailed = true;
+        return;
+    }
+
+    char className[128] = {};
+    GetClassNameA(m_hwnd, className, sizeof(className));
+    OutputDebugStringA(("ytclient: game HWND class: " + std::string(className) + "\n").c_str());
+
+    // Init ImGui backends
+    if (!ImGui_ImplWin32_Init(m_hwnd))
+    {
+        OutputDebugStringA("ytclient: ImGui_ImplWin32_Init failed\n");
+        m_imguiFailed = true;
+        return;
+    }
+
+    if (!ImGui_ImplOpenGL3_Init(nullptr))
+    {
+        OutputDebugStringA("ytclient: ImGui_ImplOpenGL3_Init failed\n");
+        m_imguiFailed = true;
+        return;
+    }
+
+    // Hook WndProc for input capture
+    setupWndProcHook(m_hwnd);
+
+    m_imguiInit = true;
+    OutputDebugStringA("ytclient: ImGui initialized successfully\n");
+}
+
+void Hooks::setupWndProcHook(HWND hwnd)
+{
+    m_origWndProc = (WNDPROC)GetWindowLongPtr(hwnd, GWLP_WNDPROC);
+    SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)&hkWndProc);
+    OutputDebugStringA("ytclient: WndProc hooked\n");
+}
+
+// ════════════════════════════════════════════════════════════
+//  ImGui render — called every frame if ImGui is initialized
+// ════════════════════════════════════════════════════════════
+void Hooks::renderImGui()
+{
+    if (!m_imguiInit) return;
+
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+
+    if (onRender)
+        onRender();
+
+    ImGui::Render();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+}
+
+// ════════════════════════════════════════════════════════════
+//  wglSwapBuffers hook — runs on the RENDER THREAD every frame
+// ════════════════════════════════════════════════════════════
+BOOL WINAPI Hooks::hkSwapBuffers(HDC hdc)
+{
+    auto& self = instance();
+
+    // ── First-frame init ─────────────────────────────────────
+    if (!self.m_imguiInit && !self.m_imguiFailed)
+    {
+        if (!self.m_firstFrameDone)
+        {
+            self.m_firstFrameDone = true;
+            OutputDebugStringA("ytclient: first frame received\n");
+
+            // Wire callbacks on the render thread (GL context is current here)
+            Client::instance().onFirstFrame();
+        }
+
+        // Try to init ImGui. If the GL context isn't ready yet,
+        // we'll retry on the next frame (up to 300 retries).
+        self.initImGui(hdc);
+        self.m_imguiRetries++;
+
+        if (self.m_imguiRetries > 300)
+        {
+            OutputDebugStringA("ytclient: initImGui gave up after 300 retries\n");
+            self.m_imguiFailed = true;
+        }
+
+        // If we just succeeded, log it and let renderImGui run below
+        if (self.m_imguiInit)
+        {
+            OutputDebugStringA("ytclient: ImGui ready, HUD will now render\n");
+        }
+    }
+
+    // ── Render HUD / menu ────────────────────────────────────
+    self.renderImGui();
+
+    // ── Frame-counting tick fallback ──────────────────────────
+    if (self.onTickFallback)
+        self.onTickFallback();
+
+    // ── Call the original wglSwapBuffers ──────────────────────
+    typedef BOOL(WINAPI* FnSwap)(HDC);
+    return ((FnSwap)self.m_origSwap)(hdc);
+}
+
+// ════════════════════════════════════════════════════════════
+//  WndProc hook — routes input to ImGui when menu is open
+// ════════════════════════════════════════════════════════════
+LRESULT WINAPI Hooks::hkWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    auto& self = instance();
+
+    if (self.m_imguiInit)
+    {
+        if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+            return true;
+
+        if (self.m_menuVisible)
+        {
+            switch (msg)
+            {
+            case WM_KEYDOWN:
+            case WM_KEYUP:
+            case WM_SYSKEYDOWN:
+            case WM_SYSKEYUP:
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_RBUTTONDOWN:
+            case WM_RBUTTONUP:
+            case WM_MBUTTONDOWN:
+            case WM_MBUTTONUP:
+            case WM_MOUSEWHEEL:
+            case WM_MOUSEMOVE:
+            case WM_CHAR:
+            case WM_INPUT:
+                return true;
+            }
+        }
+    }
+
+    if (self.m_origWndProc)
+        return CallWindowProc(self.m_origWndProc, hWnd, msg, wParam, lParam);
+
+    return DefWindowProc(hWnd, msg, wParam, lParam);
+}
+
+#pragma once
+#include <Windows.h>
+#include <functional>
+#include "imgui.h"
+
+class Hooks
+{
+public:
+    static Hooks& instance();
+
+    // Set up the wglSwapBuffers hook.
+    // Must be called before the first frame to catch it.
+    bool init();
+    void shutdown();
+
+    bool isActive() const { return m_hookOK; }
+
+    // Callbacks (wired by Client)
+    std::function<void()> onRender;
+    std::function<void()> onTickFallback;
+
+    // Menu visibility
+    bool menuVisible() const { return m_menuVisible; }
+    void setMenuVisible(bool v) { m_menuVisible = v; }
+
+private:
+    Hooks() = default;
+
+    HMODULE m_opengl32   = nullptr;
+    void*   m_origSwap   = nullptr;
+    bool    m_hookOK     = false;
+
+    // ImGui state
+    bool    m_imguiInit      = false;
+    bool    m_imguiFailed    = false;
+    bool    m_firstFrameDone = false;
+    int     m_imguiRetries   = 0;
+    HWND    m_hwnd           = nullptr;
+    WNDPROC m_origWndProc    = nullptr;
+    bool    m_menuVisible    = false;
+
+    void initImGui(HDC hdc);
+    void renderImGui();
+    void setupWndProcHook(HWND hwnd);
+
+    static BOOL   WINAPI hkSwapBuffers(HDC hdc);
+    static LRESULT WINAPI hkWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+};
+
+#include "JVM.h"
+#include "Mappings.h"
+#include "../utils/Logger.h"
+
+#include <Windows.h>
+
+typedef jint(WINAPI* Fn_GetCreatedJavaVMs)(JavaVM**, jsize, jsize*);
+
+JVM& JVM::instance()
+{
+    static JVM inst;
+    return inst;
+}
+
+bool JVM::attach()
+{
+    HMODULE hJvm = GetModuleHandleA("jvm.dll");
+    if (!hJvm)
+        hJvm = LoadLibraryA("jvm.dll");
+    if (!hJvm)
+    {
+        LOG_ERROR("jvm.dll not found");
+        return false;
+    }
+
+    auto pfn = (Fn_GetCreatedJavaVMs)GetProcAddress(hJvm, "JNI_GetCreatedJavaVMs");
+    if (!pfn)
+    {
+        LOG_ERROR("JNI_GetCreatedJavaVMs not found");
+        return false;
+    }
+
+    jsize count = 0;
+    if (pfn(&m_vm, 1, &count) != JNI_OK || count == 0)
+    {
+        LOG_ERROR("No running JVM found");
+        return false;
+    }
+    LOG_INFO("Found JVM");
+
+    // Get JNIEnv
+    if (m_vm->GetEnv((void**)&m_env, JNI_VERSION_21) != JNI_OK)
+    {
+        if (m_vm->AttachCurrentThread((void**)&m_env, nullptr) != JNI_OK)
+        {
+            LOG_ERROR("AttachCurrentThread failed");
+            return false;
+        }
+        m_attached = true;
+    }
+    LOG_INFO("Attached to JVM thread");
+
+    // Try JVMTI
+    if (m_vm->GetEnv((void**)&m_jvmti, JVMTI_VERSION_1_0) == JNI_OK)
+    {
+        jvmtiCapabilities caps = {};
+        caps.can_generate_breakpoint_events = 1;
+        caps.can_access_local_variables     = 1;
+        caps.can_get_bytecodes              = 1;
+        m_jvmti->AddCapabilities(&caps);
+        LOG_INFO("JVMTI enabled");
+    }
+    else
+    {
+        LOG_WARN("JVMTI not available; tick hook will use frame fallback");
+    }
+
+    return true;
+}
+
+void JVM::detach()
+{
+    if (m_attached && m_vm)
+    {
+        m_vm->DetachCurrentThread();
+        m_attached = false;
+    }
+}
+
+JVM::~JVM()
+{
+    if (m_jvmti)
+        m_jvmti->DisposeEnvironment();
+    detach();
+}
+
+// ── Class / method resolution ────────────────────────────────
+
+jclass JVM::findClass(const char* name)
+{
+    if (!m_env) return nullptr;
+    jclass local = m_env->FindClass(name);
+    if (!local)
+    {
+        m_env->ExceptionClear();
+        return nullptr;
+    }
+    // Return local ref; caller should make global if persisting
+    return local;
+}
+
+jmethodID JVM::getMethodID(jclass cls, const char* name, const char* sig)
+{
+    if (!m_env || !cls) return nullptr;
+    jmethodID mid = m_env->GetMethodID(cls, name, sig);
+    if (!mid) m_env->ExceptionClear();
+    return mid;
+}
+
+jmethodID JVM::getStaticMethodID(jclass cls, const char* name, const char* sig)
+{
+    if (!m_env || !cls) return nullptr;
+    jmethodID mid = m_env->GetStaticMethodID(cls, name, sig);
+    if (!mid) m_env->ExceptionClear();
+    return mid;
+}
+
+jfieldID JVM::getFieldID(jclass cls, const char* name, const char* sig)
+{
+    if (!m_env || !cls) return nullptr;
+    jfieldID fid = m_env->GetFieldID(cls, name, sig);
+    if (!fid) m_env->ExceptionClear();
+    return fid;
+}
+
+jfieldID JVM::getStaticFieldID(jclass cls, const char* name, const char* sig)
+{
+    if (!m_env || !cls) return nullptr;
+    jfieldID fid = m_env->GetStaticFieldID(cls, name, sig);
+    if (!fid) m_env->ExceptionClear();
+    return fid;
+}
+
+jobject JVM::makeGlobal(jobject local)
+{
+    if (!m_env || !local) return nullptr;
+    return m_env->NewGlobalRef(local);
+}
+
+void JVM::releaseGlobal(jobject global)
+{
+    if (!m_env || !global) return;
+    m_env->DeleteGlobalRef(global);
+}
+
+// ── Minecraft accessors ──────────────────────────────────────
+
+jobject JVM::getMinecraft()
+{
+    if (m_mcGlobal) return m_mcGlobal;
+
+    m_mcClass = findClass(Mappings::Cls::MinecraftClient);
+    if (!m_mcClass)
+    {
+        LOG_ERROR("MinecraftClient class not found");
+        return nullptr;
+    }
+    m_mcClass = (jclass)makeGlobal(m_mcClass);
+
+    m_mcGetInstance = getStaticMethodID(m_mcClass,
+        Mappings::MC::getInstance, "()Lnet/minecraft/class_310;");
+    if (!m_mcGetInstance)
+    {
+        // Try instance field instead
+        jfieldID fid = getStaticFieldID(m_mcClass,
+            Mappings::MC::instance, "Lnet/minecraft/class_310;");
+        if (fid)
+        {
+            jobject local = m_env->GetStaticObjectField(m_mcClass, fid);
+            if (local) m_mcGlobal = makeGlobal(local);
+        }
+    }
+    else
+    {
+        jobject local = m_env->CallStaticObjectMethod(m_mcClass, m_mcGetInstance);
+        if (local) m_mcGlobal = makeGlobal(local);
+    }
+
+    if (!m_mcGlobal)
+        LOG_ERROR("Failed to get MinecraftClient instance");
+
+    return m_mcGlobal;
+}
+
+jobject JVM::getPlayer()
+{
+    jobject mc = getMinecraft();
+    if (!mc) return nullptr;
+
+    jfieldID pid = getFieldID(m_mcClass, Mappings::MC::player, "Lnet/minecraft/class_746;");
+    if (!pid)
+    {
+        LOG_ERROR("player field not found");
+        return nullptr;
+    }
+    return m_env->GetObjectField(mc, pid);
+}
+
+jobject JVM::getWorld()
+{
+    jobject mc = getMinecraft();
+    if (!mc) return nullptr;
+
+    jfieldID wid = getFieldID(m_mcClass, Mappings::MC::world, "Lnet/minecraft/class_638;");
+    if (!wid) return nullptr;
+    return m_env->GetObjectField(mc, wid);
+}
+
+jobject JVM::getNetworkHandler()
+{
+    jobject player = getPlayer();
+    if (!player) return nullptr;
+
+    jclass playerCls = m_env->FindClass(Mappings::Cls::ClientPlayerEntity);
+    if (!playerCls) return nullptr;
+
+    jfieldID fid = getFieldID(playerCls,
+        Mappings::PlayerFields::networkHandler, "Lnet/minecraft/class_2596;");
+    if (!fid)
+    {
+        m_env->ExceptionClear();
+        return nullptr;
+    }
+    return m_env->GetObjectField(player, fid);
+}
+
+// ── Tick hook ────────────────────────────────────────────────
+
+bool JVM::hookTick()
+{
+    if (!m_jvmti)
+    {
+        LOG_WARN("No JVMTI; tick hook unavailable");
+        return false;
+    }
+
+    if (!m_mcClass)
+    {
+        m_mcClass = findClass(Mappings::Cls::MinecraftClient);
+        if (!m_mcClass)
+        {
+            LOG_ERROR("Cannot hook tick: MC class missing");
+            return false;
+        }
+    }
+
+    m_tickMethod = getMethodID(m_mcClass, Mappings::MC::tick, "()V");
+    if (!m_tickMethod)
+    {
+        LOG_ERROR("tick() method not found");
+        return false;
+    }
+
+    jvmtiError err = m_jvmti->SetBreakpoint(m_tickMethod, 0);
+    if (err != JVMTI_ERROR_NONE)
+    {
+        LOG_ERROR("SetBreakpoint failed: " + std::to_string(err));
+        return false;
+    }
+
+    jvmtiEventCallbacks callbacks = {};
+    callbacks.Breakpoint = &JVM::breakpointCB;
+    m_jvmti->SetEventCallbacks(&callbacks, sizeof(callbacks));
+    m_jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_BREAKPOINT, nullptr);
+
+    LOG_INFO("Tick breakpoint set on MinecraftClient.tick()");
+    return true;
+}
+
+void JNICALL JVM::breakpointCB(jvmtiEnv* jvmti, JNIEnv* jni,
+    jthread thread, jmethodID method, jlocation location)
+{
+    auto& inst = instance();
+    if (inst.m_tickCallback)
+        inst.m_tickCallback();
+}
+
+#pragma once
+#include <jni.h>
+#include <jvmti.h>
+#include <string>
+#include <functional>
+
+class JVM
+{
+public:
+    static JVM& instance();
+
+    bool attach();
+    void detach();
+
+    JNIEnv* env()    const { return m_env; }
+    JavaVM* vm()     const { return m_vm; }
+    jvmtiEnv* jvmti() const { return m_jvmti; }
+
+    // ── Minecraft accessors ──────────────────────────────────
+    jobject getMinecraft();
+    jobject getPlayer();
+    jobject getWorld();
+    jobject getNetworkHandler();
+
+    // ── Tick hook via JVMTI breakpoint ───────────────────────
+    bool hookTick();
+    void setTickCallback(std::function<void()> cb) { m_tickCallback = std::move(cb); }
+
+    // ── Class / method resolution ────────────────────────────
+    jclass  findClass(const char* name);
+    jmethodID getMethodID(jclass cls, const char* name, const char* sig);
+    jmethodID getStaticMethodID(jclass cls, const char* name, const char* sig);
+    jfieldID  getFieldID(jclass cls, const char* name, const char* sig);
+    jfieldID  getStaticFieldID(jclass cls, const char* name, const char* sig);
+
+    // ── Global ref helpers ───────────────────────────────────
+    jobject makeGlobal(jobject local);
+    void    releaseGlobal(jobject global);
+
+private:
+    JVM() = default;
+    ~JVM();
+
+    JavaVM*   m_vm   = nullptr;
+    JNIEnv*   m_env  = nullptr;
+    jvmtiEnv* m_jvmti = nullptr;
+    bool      m_attached = false;
+
+    // Cached
+    jobject   m_mcGlobal     = nullptr;
+    jclass    m_mcClass      = nullptr;
+    jmethodID m_mcGetInstance = nullptr;
+
+    // Tick
+    std::function<void()> m_tickCallback;
+    jmethodID m_tickMethod = nullptr;
+
+    static void JNICALL breakpointCB(jvmtiEnv* jvmti, JNIEnv* jni,
+        jthread thread, jmethodID method, jlocation location);
+};
+
+#pragma once
+#include <jni.h>
+#include <jvmti.h>
+
+#ifndef JNI_VERSION_21
+#define JNI_VERSION_21 0x00150000
+#endif
+
+namespace Mappings
+{
+    // ════════════════════════════════════════════════════════════
+    //  Minecraft 1.21.11 — Fabric intermediary mappings
+    //  Hardcoded for this version; no update support needed.
+    // ════════════════════════════════════════════════════════════
+
+    // ── Classes ──────────────────────────────────────────────
+    namespace Cls
+    {
+        constexpr const char* MinecraftClient       = "net/minecraft/class_310";
+        constexpr const char* ClientPlayerEntity    = "net/minecraft/class_746";
+        constexpr const char* ClientWorld           = "net/minecraft/class_638";
+        constexpr const char* ClientPlayNetworkHandler = "net/minecraft/class_2596";
+        constexpr const char* Entity                = "net/minecraft/class_1297";
+        constexpr const char* LivingEntity          = "net/minecraft/class_1309";
+        constexpr const char* PlayerEntity          = "net/minecraft/class_1657";
+        constexpr const char* Box                   = "net/minecraft/class_258";
+        constexpr const char* Vec3d                 = "net/minecraft/class_243";
+        constexpr const char* ItemStack             = "net/minecraft/class_1799";
+        constexpr const char* Hand                   = "net/minecraft/class_1268";
+        constexpr const char* Direction              = "net/minecraft/class_2350";
+        constexpr const char* GameMode               = "net/minecraft/class_1934";
+
+        // Packet classes
+        namespace Packet
+        {
+            constexpr const char* PlayerMoveC2SPacketFull      = "net/minecraft/class_2846";
+            constexpr const char* PlayerMoveC2SPacketPos      = "net/minecraft/class_2848";
+            constexpr const char* PlayerMoveC2SPacketLook     = "net/minecraft/class_2849";
+            constexpr const char* PlayerMoveC2SPacketOnGround = "net/minecraft/class_2850";
+            constexpr const char* PlayerInteractEntityC2SPacket = "net/minecraft/class_2824";
+            constexpr const char* PlayerActionC2SPacket       = "net/minecraft/class_2843";
+            constexpr const char* UpdateSelectedSlotC2SPacket = "net/minecraft/class_2868";
+            constexpr const char* HandSwingC2SPacket          = "net/minecraft/class_2876";
+        }
+    }
+
+    // ── MinecraftClient ──────────────────────────────────────
+    namespace MC
+    {
+        constexpr const char* tick        = "method_1574";   // ()V
+        constexpr const char* getInstance = "method_1551";   // ()Lnet/minecraft/class_310;
+        constexpr const char* player      = "field_1724";    // Lnet/minecraft/class_746;
+        constexpr const char* world       = "field_1687";    // Lnet/minecraft/class_638;
+        constexpr const char* options     = "field_1690";    // Lnet/minecraft/class_315;
+        constexpr const char* currentScreen = "field_1753";  // Lnet/minecraft/class_437;
+        constexpr const char* instance    = "field_1688";    // static Lnet/minecraft/class_310;
+    }
+
+    // ── ClientPlayerEntity ───────────────────────────────────
+    namespace Player
+    {
+        constexpr const char* yaw             = "field_40116";   // float
+        constexpr const char* pitch           = "field_7283";    // float
+        constexpr const char* prevYaw         = "field_6200";    // wait, need to verify
+        constexpr const char* posX            = "field_40117";   // actually getX
+        constexpr const char* x               = "field_28206";
+        constexpr const char* y               = "field_28208";
+        constexpr const char* z               = "field_28210";
+        constexpr const char* onGround        = "field_38985";   // hmm, need to check
+        constexpr const char* velocityX       = "field_28197";
+        constexpr const char* velocityY       = "field_28199";
+        constexpr const char* velocityZ       = "field_28201";
+        constexpr const char* sprinting       = "field_20713";   // or method
+        constexpr const char* fallDistance    = "field_3878";    // wait
+        constexpr const char* networkHandler  = "field_26696";   // actually on the player
+        constexpr const char* getAbilities    = "method_31543";
+        constexpr const char* getInventory    = "method_31546";
+        constexpr const char* getMainHandStack = "method_31557";
+        constexpr const char* getStackInHand  = "method_42809";
+
+        // Methods
+        constexpr const char* getX            = "method_23317";
+        constexpr const char* getY            = "method_23318";
+        constexpr const char* getZ            = "method_23319";
+        constexpr const char* setSprinting    = "method_5667";
+        constexpr const char* setVelocity     = "method_5668";  // hmm
+        constexpr const char* isSprinting     = "method_5674";
+        constexpr const char* getHealth       = "method_5618";
+        constexpr const char* swingHand       = "method_6114";
+        constexpr const char* getEyeY         = "method_5700";
+        constexpr const char* attack          = "method_7324";    // (Lnet/minecraft/class_1297;)V
+    }
+
+    // ── Entity ───────────────────────────────────────────────
+    namespace Entity
+    {
+        constexpr const char* getId           = "method_5628";
+        constexpr const char* getX            = "method_23317";   // ()D
+        constexpr const char* getY            = "method_23318";   // ()D
+        constexpr const char* getZ            = "method_23319";   // ()D
+        constexpr const char* getVelocity     = "method_5669";    // ()Lnet/minecraft/class_243;
+        constexpr const char* setVelocityD    = "method_5668";    // (DDD)V  (wait—might be setSprinting)
+        constexpr const char* setVelocityV    = "method_5670";    // (Lnet/minecraft/class_243;)V
+        constexpr const char* velocityField   = "field_26430";    // Lnet/minecraft/class_243;
+        constexpr const char* distanceTo      = "method_5715";
+        constexpr const char* getEyeY         = "method_5700";
+        constexpr const char* getBoundingBox  = "method_5683";    // ()Lnet/minecraft/class_258;
+        constexpr const char* isAlive         = "method_5685";    // ()Z
+        constexpr const char* isDead          = "method_5684";    // ()Z
+        constexpr const char* getName         = "method_5516";
+        constexpr const char* getYaw          = "method_5626";    // ()F
+        constexpr const char* getPitch        = "method_5627";    // ()F
+        constexpr const char* setYaw          = "method_5663";    // (F)V
+        constexpr const char* setPitch        = "method_5664";    // (F)V  -- might differ
+        constexpr const char* yawField        = "field_5985";     // F
+        constexpr const char* pitchField      = "field_5986";     // F
+        constexpr const char* prevYaw         = "field_5990";     // F
+        constexpr const char* prevPitch       = "field_5991";     // F
+        constexpr const char* onGround        = "field_38985";    // wait—Entity.onGround is field_2430 in some versions
+        constexpr const char* fallDistance    = "field_3878";     // F
+    }
+
+    // ── Vec3d ────────────────────────────────────────────────
+    namespace Vec3d
+    {
+        constexpr const char* getX = "method_1020";   // ()D
+        constexpr const char* getY = "method_1021";   // ()D
+        constexpr const char* getZ = "method_1022";   // ()D
+        constexpr const char* ctor = "<init>";        // (DDD)V
+    }
+
+    // ── PlayerAbilities ──────────────────────────────────────
+    namespace Abilities
+    {
+        constexpr const char* cls            = "net/minecraft/class_1656";
+        constexpr const char* flying         = "field_7465";   // Z
+        constexpr const char* allowFlying    = "field_7467";   // Z
+        constexpr const char* creativeMode   = "field_7469";   // Z
+        constexpr const char* walkSpeed      = "field_7471";   // F
+        constexpr const char* flySpeed       = "field_7472";   // F
+    }
+
+    // ── Box (for bounding box) ───────────────────────────────
+    namespace Box
+    {
+        constexpr const char* getMinX = "method_1020";   // ()D  -- wait, these overlap with Vec3d
+        constexpr const char* getMinY = "method_1021";
+        constexpr const char* getMinZ = "method_1022";
+        constexpr const char* getMaxX = "method_1023";
+        constexpr const char* getMaxY = "method_1024";
+        constexpr const char* getMaxZ = "method_1025";
+        constexpr const char* getCenter = "method_5700";  // hmm
+    }
+
+    // ── ClientPlayNetworkHandler ─────────────────────────────
+    namespace NetHandler
+    {
+        constexpr const char* sendPacket      = "method_2883";   // (Lnet/minecraft/class_2596;)V
+        constexpr const char* getPlayer       = "method_2864";   // hmm
+    }
+
+    // ── ClientPlayerEntity network handler field ─────────────
+    namespace PlayerFields
+    {
+        constexpr const char* networkHandler  = "field_26696";  // ClientPlayNetworkHandler
+    }
+
+    // ── SimpleOption (for gamma / settings) ─────────────────
+    namespace Options
+    {
+        constexpr const char* cls             = "net/minecraft/class_315";
+        constexpr const char* gammaOption     = "field_2162";      // Lnet/minecraft/class_7172;
+        constexpr const char* getGammaValue   = "method_19701";
+        constexpr const char* setGamma        = "method_19702";
+    }
+
+    // ── SimpleOption<T> ──────────────────────────────────────
+    namespace SimpleOption
+    {
+        constexpr const char* cls      = "net/minecraft/class_7172";
+        constexpr const char* getValue = "method_41798";   // ()Ljava/lang/Object;
+        constexpr const char* setValue = "method_41799";   // (Ljava/lang/Object;)V
+    }
+
+    // ── ClientWorld ──────────────────────────────────────────
+    namespace World
+    {
+        constexpr const char* getEntities     = "method_18112";   // ()Ljava/lang/Iterable;
+        constexpr const char* getRawEntities  = "method_17940";
+        constexpr const char* getBrightness   = "method_22470";
+        constexpr const char* entitiesField   = "field_17940";    // entity lookup field
+    }
+}
+
+#include "Client.h"
+#include "JVM.h"
+#include "Hooks.h"
+#include "../utils/Logger.h"
+#include "../menu/Menu.h"
+#include "../menu/Theme.h"
+#include "../modules/ModuleManager.h"
+#include "../packet/TickSync.h"
+#include "../packet/PacketManager.h"
+
+#include "../modules/Speed.h"
+#include "../modules/Fly.h"
+#include "../modules/NoFall.h"
+#include "../modules/Sprint.h"
+#include "../modules/KillAura.h"
+#include "../modules/Reach.h"
+#include "../modules/FullBright.h"
+
+Client& Client::instance()
+{
+    static Client inst;
+    return inst;
+}
+
+// ════════════════════════════════════════════════════════════
+//  Entry — called from DllMain (DLL_PROCESS_ATTACH)
+//  Creates the background init thread.
+// ════════════════════════════════════════════════════════════
+void Client::startThread()
+{
+    m_thread = std::thread([this]() { run(); });
+}
+
+// ════════════════════════════════════════════════════════════
+//  Startup — runs on the background init thread
+// ════════════════════════════════════════════════════════════
+void Client::run()
+{
+    Logger::init();
+
+    // Allocate a console so the user can see diagnostic output
+    if (AllocConsole())
+    {
+        FILE* out = nullptr;
+        FILE* err = nullptr;
+        freopen_s(&out, "CONOUT$", "w", stdout);
+        freopen_s(&err, "CONOUT$", "w", stderr);
+        SetConsoleTitleW(L"ytclient");
+    }
+
+    printf("ytclient injected into process\n");
+    printf("Log file: %s\n", Logger::getLogPath().c_str());
+    printf("Waiting for first frame to init ImGui...\n");
+    OutputDebugStringA("ytclient: DLL loaded\n");
+
+    // Hook MUST be set up as fast as possible so the first frame gets intercepted.
+    // This must happen BEFORE any blocking or JVM work.
+    if (!Hooks::instance().init())
+    {
+        printf("FATAL: wglSwapBuffers hook failed\n");
+        OutputDebugStringA("ytclient: hook init failed\n");
+        return;
+    }
+    printf("wglSwapBuffers hook installed. Waiting for JVM...\n");
+
+    // ── JVM setup (best-effort, non-blocking for the hook) ──────
+    if (initJVM())
+    {
+        initTickHook();
+        initModules();
+        printf("ytclient fully loaded — %zu modules registered\n",
+            ModuleManager::instance().size());
+    }
+    else
+    {
+        printf("WARNING: JVM init failed. Modules will be unavailable.\n");
+    }
+
+    m_ready = true;
+    m_running = true;
+
+    // Idle loop — keeps the init thread alive
+    while (m_running.load())
+        Sleep(500);
+}
+
+bool Client::initJVM()
+{
+    if (!JVM::instance().attach())
+    {
+        printf("JVM attach failed (is the game running?)\n");
+        OutputDebugStringA("ytclient: JVM attach failed\n");
+        return false;
+    }
+    printf("JVM attached successfully\n");
+
+    // Retry MinecraftClient resolution a few times (game may still be loading)
+    for (int i = 0; i < 15; i++)
+    {
+        if (JVM::instance().getMinecraft())
+        {
+            printf("MinecraftClient instance resolved\n");
+            strcpy_s(m_hudMessage, "ytclient loaded");
+            return true;
+        }
+        printf("Waiting for MinecraftClient... (%d/15)\n", i + 1);
+        Sleep(500);
+    }
+
+    printf("Could not resolve MinecraftClient instance\n");
+    return false;
+}
+
+bool Client::initTickHook()
+{
+    JVM::instance().setTickCallback([this]() { onTick(); });
+    if (JVM::instance().hookTick())
+    {
+        printf("Tick hook active (JVMTI breakpoint)\n");
+        return true;
+    }
+    printf("JVMTI tick hook unavailable; using frame fallback\n");
+    return false;
+}
+
+void Client::initModules()
+{
+    auto& mgr = ModuleManager::instance();
+    mgr.add<Speed>();
+    mgr.add<Fly>();
+    mgr.add<NoFall>();
+    mgr.add<Sprint>();
+    mgr.add<KillAura>();
+    mgr.add<Reach>();
+    mgr.add<FullBright>();
+}
+
+// ════════════════════════════════════════════════════════════
+//  First frame — called from hkSwapBuffers (RENDER THREAD)
+//  This wires the render callback so the HUD/menu draw.
+// ════════════════════════════════════════════════════════════
+void Client::onFirstFrame()
+{
+    OutputDebugStringA("ytclient: first frame, wiring callbacks\n");
+
+    Hooks::instance().onRender = [this]() { onRender(); };
+
+    // Callback for the frame-counting tick fallback
+    if (!JVM::instance().jvmti())
+    {
+        Hooks::instance().onTickFallback = [this]() { onTickFallback(); };
+        m_lastTickTime = GetTickCount();
+        OutputDebugStringA("ytclient: frame-counting tick fallback active\n");
+    }
+}
+
+// ════════════════════════════════════════════════════════════
+//  Per-frame render callback (RENDER THREAD)
+// ════════════════════════════════════════════════════════════
+void Client::onRender()
+{
+    // RightShift toggle — always operational, even before m_ready
+    static bool rshiftPrev = false;
+    bool rshiftNow = (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+    if (rshiftNow && !rshiftPrev)
+        toggleMenu();
+    rshiftPrev = rshiftNow;
+
+    // Menu rendering
+    if (Hooks::instance().menuVisible())
+        Menu::instance().render();
+
+    // ── HUD overlay ────────────────────────────────────────────
+    // Always draw a watermark + status so the user knows it's alive.
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    char fpsText[64];
+    snprintf(fpsText, sizeof(fpsText), "ytclient | %.0f FPS", io.Framerate);
+    ImVec2 fpsSize = ImGui::CalcTextSize(fpsText);
+    float x = io.DisplaySize.x - fpsSize.x - 10.0f;
+    float y = 6.0f;
+
+    // Subtle dark background pill
+    dl->AddRectFilled(
+        ImVec2(x - 6, y - 3),
+        ImVec2(x + fpsSize.x + 6, y + fpsSize.y + 3),
+        IM_COL32(16, 12, 8, 140), 4.0f);
+
+    // Amber accent dot when ready
+    ImU32 dotCol = m_ready.load()
+        ? IM_COL32(234, 176, 72, 255)   // amber = ready
+        : IM_COL32(234, 72, 72, 255);    // red = loading
+    dl->AddCircleFilled(ImVec2(x - 2, y + fpsSize.y * 0.5f), 3.0f, dotCol);
+
+    dl->AddText(ImVec2(x, y), IM_COL32(230, 225, 215, 220), fpsText);
+
+    // Draw HUD message if set (e.g. "ytclient loaded")
+    if (m_hudMessage[0] != '\0')
+    {
+        ImVec2 msgSize = ImGui::CalcTextSize(m_hudMessage);
+        dl->AddText(
+            ImVec2(10, io.DisplaySize.y - msgSize.y - 10),
+            IM_COL32(234, 176, 72, 100), m_hudMessage);
+    }
+
+    // Module overlays (ESP, tracers, etc.)
+    if (m_ready.load())
+        ModuleManager::instance().renderAll();
+}
+
+// ════════════════════════════════════════════════════════════
+//  Tick callbacks
+// ════════════════════════════════════════════════════════════
+void Client::onTick()
+{
+    TickSync::instance().onTickStart();
+}
+
+void Client::onTickFallback()
+{
+    DWORD now = GetTickCount();
+    m_tickAccumulator += (now - m_lastTickTime);
+    m_lastTickTime = now;
+
+    const DWORD tickInterval = 50;
+    while (m_tickAccumulator >= tickInterval)
+    {
+        m_tickAccumulator -= tickInterval;
+        TickSync::instance().onTickStart();
+    }
+}
+
+// ════════════════════════════════════════════════════════════
+//  Shutdown — called from DllMain (DLL_PROCESS_DETACH)
+//  Waits for the background thread, then cleans up.
+// ════════════════════════════════════════════════════════════
+void Client::shutdown()
+{
+    // Signal the background thread to exit
+    m_running = false;
+
+    // Wait for it to wake up and finish
+    if (m_thread.joinable())
+        m_thread.join();
+
+    m_ready = false;
+
+    Hooks::instance().shutdown();
+    PacketManager::instance().clearAll();
+    JVM::instance().detach();
+
+    if (GetConsoleWindow())
+        FreeConsole();
+
+    OutputDebugStringA("ytclient: unloaded\n");
+}
+
+void Client::toggleMenu()
+{
+    bool cur = Hooks::instance().menuVisible();
+    Hooks::instance().setMenuVisible(!cur);
+}
+
+#pragma once
+#include <Windows.h>
+#include <atomic>
+#include <thread>
+
+class Client
+{
+public:
+    static Client& instance();
+
+    void startThread();  // Called from DllMain — spawns the background thread
+    void shutdown();     // Called from DllMain — signals exit + cleans up
+
+    bool isRunning() const { return m_running.load(); }
+    bool isReady()   const { return m_ready.load(); }
+
+    void toggleMenu();
+    void onFirstFrame();  // Called from hkSwapBuffers (render thread)
+
+    // For HUD overlay
+    const char* hudMessage() const { return m_hudMessage; }
+
+private:
+    Client() = default;
+    ~Client() = default;
+
+    void run();
+
+    std::atomic<bool> m_running{false};
+    std::atomic<bool> m_ready{false};
+    std::thread       m_thread;
+
+    DWORD m_lastTickTime   = 0;
+    DWORD m_tickAccumulator = 0;
+
+    char m_hudMessage[256] = {};
+
+    void onRender();
+    void onTick();
+    void onTickFallback();
+
+    bool initJVM();
+    bool initTickHook();
+    void initModules();
+};
