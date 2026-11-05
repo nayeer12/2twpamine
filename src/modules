@@ -1,0 +1,1052 @@
+#pragma once
+#include <string>
+#include <memory>
+#include <vector>
+#include <map>
+#include <unordered_map>
+#include <functional>
+
+// ── Categories ───────────────────────────────────────────────
+enum class Category : int
+{
+    Movement = 0,
+    Combat   = 1,
+    Player   = 2,
+    Render   = 3,
+    World    = 4,
+    Misc     = 5
+};
+
+inline const char* categoryName(Category c)
+{
+    switch (c)
+    {
+    case Category::Movement: return "Movement";
+    case Category::Combat:   return "Combat";
+    case Category::Player:   return "Player";
+    case Category::Render:   return "Render";
+    case Category::World:    return "World";
+    case Category::Misc:     return "Misc";
+    }
+    return "Unknown";
+}
+
+// ── Setting types ────────────────────────────────────────────
+enum class SettingType
+{
+    Bool,
+    Float,
+    Int,
+    Keybind
+};
+
+struct Setting
+{
+    std::string name;
+    SettingType type;
+    bool   boolVal   = false;
+    float  floatVal  = 0.0f;
+    float  floatMin  = 0.0f;
+    float  floatMax  = 1.0f;
+    int    intVal    = 0;
+    int    intMin    = 0;
+    int    intMax    = 100;
+    int    keyVal    = 0;
+};
+
+// ── Base Module ──────────────────────────────────────────────
+class Module
+{
+public:
+    Module(std::string name, std::string desc, Category cat)
+        : m_name(std::move(name)), m_desc(std::move(desc)), m_category(cat) {}
+    virtual ~Module() = default;
+
+    virtual void onEnable()  {}
+    virtual void onDisable() {}
+    virtual void onTick()    {}
+    virtual void onRender()  {}
+
+    void setEnabled(bool enabled)
+    {
+        if (m_enabled == enabled) return;
+        m_enabled = enabled;
+        if (enabled) onEnable();
+        else onDisable();
+    }
+
+    bool isEnabled() const { return m_enabled; }
+    void toggle() { setEnabled(!m_enabled); }
+
+    const std::string& name() const { return m_name; }
+    const std::string& desc() const { return m_desc; }
+    Category category() const { return m_category; }
+
+    // Settings
+    Setting& addBool(const std::string& n, bool def)
+    {
+        m_settings.push_back({n, SettingType::Bool, def});
+        return m_settings.back();
+    }
+    Setting& addFloat(const std::string& n, float def, float min, float max)
+    {
+        m_settings.push_back({n, SettingType::Float, false, def, min, max});
+        return m_settings.back();
+    }
+    Setting& addInt(const std::string& n, int def, int min, int max)
+    {
+        m_settings.push_back({n, SettingType::Int, false, 0, 0, 0, def, min, max});
+        return m_settings.back();
+    }
+    Setting& addKey(const std::string& n, int def)
+    {
+        m_settings.push_back({n, SettingType::Keybind, false, 0, 0, 0, 0, 0, 0, def});
+        return m_settings.back();
+    }
+
+    std::vector<Setting>& settings() { return m_settings; }
+
+    Setting* getSetting(const std::string& n)
+    {
+        for (auto& s : m_settings)
+            if (s.name == n) return &s;
+        return nullptr;
+    }
+
+    bool   getBool(const std::string& n, bool def = false)
+    {
+        auto* s = getSetting(n); return s ? s->boolVal : def;
+    }
+    float  getFloat(const std::string& n, float def = 0)
+    {
+        auto* s = getSetting(n); return s ? s->floatVal : def;
+    }
+    int    getInt(const std::string& n, int def = 0)
+    {
+        auto* s = getSetting(n); return s ? s->intVal : def;
+    }
+
+protected:
+    std::string       m_name;
+    std::string       m_desc;
+    Category          m_category;
+    bool              m_enabled = false;
+    std::vector<Setting> m_settings;
+};
+
+#include "ModuleManager.h"
+#include "../utils/Logger.h"
+
+ModuleManager& ModuleManager::instance()
+{
+    static ModuleManager inst;
+    return inst;
+}
+
+void ModuleManager::buildCategories()
+{
+    for (auto& mod : m_modules)
+        m_byCategory[mod->category()].push_back(mod.get());
+    m_categorized = true;
+}
+
+void ModuleManager::tickAll()
+{
+    if (!m_categorized) buildCategories();
+
+    for (auto& mod : m_modules)
+    {
+        if (mod->isEnabled())
+        {
+            try { mod->onTick(); }
+            catch (...) { LOG_WARN("Exception in " + mod->name() + "::onTick"); }
+        }
+    }
+}
+
+void ModuleManager::renderAll()
+{
+    if (!m_categorized) buildCategories();
+
+    for (auto& mod : m_modules)
+    {
+        if (mod->isEnabled())
+        {
+            try { mod->onRender(); }
+            catch (...) {}
+        }
+    }
+}
+
+std::vector<Module*>& ModuleManager::getByCategory(Category cat)
+{
+    if (!m_categorized) buildCategories();
+    return m_byCategory[cat];
+}
+
+Module* ModuleManager::find(const std::string& name)
+{
+    for (auto& mod : m_modules)
+        if (mod->name() == name) return mod.get();
+    return nullptr;
+}
+
+#pragma once
+#include "Module.h"
+#include <vector>
+#include <memory>
+#include <functional>
+#include <map>
+
+class ModuleManager
+{
+public:
+    static ModuleManager& instance();
+
+    template<typename T, typename... Args>
+    void add(Args&&... args)
+    {
+        auto mod = std::make_unique<T>(std::forward<Args>(args)...);
+        m_modules.push_back(std::move(mod));
+    }
+
+    void tickAll();
+    void renderAll();
+
+    std::vector<Module*>& getByCategory(Category cat);
+
+    const std::vector<std::unique_ptr<Module>>& all() const { return m_modules; }
+
+    size_t size() const { return m_modules.size(); }
+
+    Module* find(const std::string& name);
+
+private:
+    ModuleManager() = default;
+
+    std::vector<std::unique_ptr<Module>> m_modules;
+    std::map<Category, std::vector<Module*>> m_byCategory;
+    bool m_categorized = false;
+
+    void buildCategories();
+};
+
+#include "NoFall.h"
+#include "../core/JVM.h"
+#include "../core/Mappings.h"
+#include "../packet/PacketManager.h"
+
+void NoFall::onTick()
+{
+    auto& jvm = JVM::instance();
+    JNIEnv* env = jvm.env();
+    if (!env) return;
+
+    jobject player = jvm.getPlayer();
+    if (!player) return;
+
+    jclass entityCls = jvm.findClass(Mappings::Cls::Entity);
+    if (!entityCls) return;
+
+    // Get velocity to check if falling
+    jmethodID getVel = jvm.getMethodID(entityCls,
+        Mappings::Entity::getVelocity, "()Lnet/minecraft/class_243;");
+    if (!getVel) { env->DeleteLocalRef(entityCls); return; }
+
+    jobject vel = env->CallObjectMethod(player, getVel);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(entityCls); return; }
+    if (!vel) { env->DeleteLocalRef(entityCls); return; }
+
+    jclass vecCls = jvm.findClass(Mappings::Cls::Vec3d);
+    if (!vecCls) { env->DeleteLocalRef(entityCls); env->DeleteLocalRef(vel); return; }
+
+    jmethodID getY = jvm.getMethodID(vecCls, Mappings::Vec3d::getY, "()D");
+    if (!getY)
+    {
+        env->DeleteLocalRef(entityCls); env->DeleteLocalRef(vel); env->DeleteLocalRef(vecCls);
+        return;
+    }
+
+    double vy = env->CallDoubleMethod(vel, getY);
+
+    // If falling (negative Y velocity), queue an onGround packet
+    if (vy < -0.3)
+    {
+        PacketManager::instance().sendOnGround(true);
+    }
+
+    env->DeleteLocalRef(entityCls);
+    env->DeleteLocalRef(vel);
+    env->DeleteLocalRef(vecCls);
+}
+
+#pragma once
+#include "Module.h"
+
+class NoFall : public Module
+{
+public:
+    NoFall() : Module("NoFall", "Prevents fall damage", Category::Movement) {}
+    void onTick() override;
+};
+
+#include "Reach.h"
+#include "../core/JVM.h"
+#include "../core/Mappings.h"
+#include "../utils/Logger.h"
+
+// Reach modifies the player's entity interaction range attribute.
+// In 1.21.x this is an EntityAttribute instance on the player.
+// We attempt field-level access; if the attribute system differs,
+// the module gracefully no-ops.
+
+void Reach::onEnable()
+{
+    auto& jvm = JVM::instance();
+    JNIEnv* env = jvm.env();
+    if (!env) return;
+
+    jobject player = jvm.getPlayer();
+    if (!player) return;
+
+    // Try to access the attribute container
+    jclass livingCls = jvm.findClass(Mappings::Cls::LivingEntity);
+    if (!livingCls) return;
+
+    // getAttributeContainer() -> method_6078 or similar
+    // In 1.21.x: LivingEntity.getAttributeContainer()
+    jmethodID getAttrContainer = jvm.getMethodID(livingCls,
+        "method_6078", "()Lnet/minecraft/class_7134;");
+    if (!getAttrContainer)
+    {
+        LOG_WARN("getAttributeContainer not found; Reach disabled");
+        env->DeleteLocalRef(livingCls);
+        setEnabled(false);
+        return;
+    }
+
+    jobject container = env->CallObjectMethod(player, getAttrContainer);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(livingCls); return; }
+    if (!container) { env->DeleteLocalRef(livingCls); return; }
+
+    // AttributeContainer.getCustomInstance(EntityAttribute)
+    // This requires the EntityAttributes.ENTITY_INTERACTION_RANGE registry entry
+    // which is complex to resolve via JNI. As a simpler approach,
+    // we set the field directly if accessible.
+
+    LOG_INFO("Reach: attribute container obtained; range modification depends on attribute resolution");
+    // TODO: Resolve EntityAttributes.ENTITY_INTERACTION_RANGE registry entry
+    // and call getCustomInstance + setBaseValue
+
+    env->DeleteLocalRef(livingCls);
+    env->DeleteLocalRef(container);
+}
+
+void Reach::onDisable()
+{
+    // Restore would go here once attribute resolution is implemented
+}
+
+#pragma once
+#include "Module.h"
+
+class Reach : public Module
+{
+public:
+    Reach() : Module("Reach", "Extends interaction range", Category::Player)
+    {
+        addFloat("Range", 5.0f, 3.0f, 8.0f);
+    }
+    void onEnable() override;
+    void onDisable() override;
+private:
+    float m_original = 0.0f;
+    bool  m_hasOriginal = false;
+};
+
+#include "Speed.h"
+#include "../core/JVM.h"
+#include "../core/Mappings.h"
+#include "../utils/Logger.h"
+#include <cmath>
+
+void Speed::onTick()
+{
+    auto& jvm = JVM::instance();
+    JNIEnv* env = jvm.env();
+    if (!env) return;
+
+    jobject player = jvm.getPlayer();
+    if (!player) return;
+
+    jclass entityCls = jvm.findClass(Mappings::Cls::Entity);
+    if (!entityCls) return;
+
+    // Get current velocity
+    jmethodID getVel = jvm.getMethodID(entityCls,
+        Mappings::Entity::getVelocity, "()Lnet/minecraft/class_243;");
+    if (!getVel) { env->DeleteLocalRef(entityCls); return; }
+
+    jobject vel = env->CallObjectMethod(player, getVel);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(entityCls); return; }
+    if (!vel) { env->DeleteLocalRef(entityCls); return; }
+
+    // Extract X, Y, Z
+    jclass vecCls = jvm.findClass(Mappings::Cls::Vec3d);
+    if (!vecCls) { env->DeleteLocalRef(entityCls); env->DeleteLocalRef(vel); return; }
+
+    jmethodID getX = jvm.getMethodID(vecCls, Mappings::Vec3d::getX, "()D");
+    jmethodID getY = jvm.getMethodID(vecCls, Mappings::Vec3d::getY, "()D");
+    jmethodID getZ = jvm.getMethodID(vecCls, Mappings::Vec3d::getZ, "()D");
+    if (!getX || !getY || !getZ)
+    {
+        env->DeleteLocalRef(entityCls); env->DeleteLocalRef(vel); env->DeleteLocalRef(vecCls);
+        return;
+    }
+
+    double vx = env->CallDoubleMethod(vel, getX);
+    double vy = env->CallDoubleMethod(vel, getY);
+    double vz = env->CallDoubleMethod(vel, getZ);
+
+    // Only boost if moving
+    float factor = getFloat("Multiplier", 1.5f);
+    double horizSpeed = std::sqrt(vx * vx + vz * vz);
+
+    if (horizSpeed > 0.01)
+    {
+        vx *= factor;
+        vz *= factor;
+
+        // Try setVelocity(DDD) first
+        jmethodID setVelD = jvm.getMethodID(entityCls,
+            Mappings::Entity::setVelocityD, "(DDD)V");
+        if (setVelD)
+        {
+            env->CallVoidMethod(player, setVelD, vx, vy, vz);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        else
+        {
+            // Fallback: setVelocity(Vec3d)
+            jmethodID ctor = env->GetMethodID(vecCls, "<init>", "(DDD)V");
+            jmethodID setVelV = jvm.getMethodID(entityCls,
+                Mappings::Entity::setVelocityV, "(Lnet/minecraft/class_243;)V");
+            if (ctor && setVelV)
+            {
+                jobject newVel = env->NewObject(vecCls, ctor, vx, vy, vz);
+                env->CallVoidMethod(player, setVelV, newVel);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                env->DeleteLocalRef(newVel);
+            }
+        }
+    }
+
+    env->DeleteLocalRef(entityCls);
+    env->DeleteLocalRef(vel);
+    env->DeleteLocalRef(vecCls);
+}
+
+#pragma once
+#include "Module.h"
+
+class Speed : public Module
+{
+public:
+    Speed() : Module("Speed", "Increases movement speed", Category::Movement)
+    {
+        addFloat("Multiplier", 1.5f, 1.0f, 5.0f);
+    }
+    void onTick() override;
+};
+
+#include "Sprint.h"
+#include "../core/JVM.h"
+#include "../core/Mappings.h"
+
+void Sprint::onTick()
+{
+    auto& jvm = JVM::instance();
+    JNIEnv* env = jvm.env();
+    if (!env) return;
+
+    jobject player = jvm.getPlayer();
+    if (!player) return;
+
+    jclass playerCls = jvm.findClass(Mappings::Cls::ClientPlayerEntity);
+    if (!playerCls) return;
+
+    jmethodID setSprint = jvm.getMethodID(playerCls,
+        Mappings::Player::setSprinting, "(Z)V");
+    if (setSprint)
+        env->CallVoidMethod(player, setSprint, JNI_TRUE);
+
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(playerCls);
+}
+
+#pragma once
+#include "Module.h"
+
+class Sprint : public Module
+{
+public:
+    Sprint() : Module("Sprint", "Automatically sprints", Category::Movement)
+    {
+        addKey("Keybind", 0);
+    }
+    void onTick() override;
+};
+
+#include "Fly.h"
+#include "../core/JVM.h"
+#include "../core/Mappings.h"
+#include "../packet/PacketManager.h"
+#include "../utils/Logger.h"
+#include <Windows.h>
+
+static void setAbility(JNIEnv* env, jobject abilities, const char* fieldName, jboolean val)
+{
+    auto& jvm = JVM::instance();
+    jclass abCls = jvm.findClass(Mappings::Abilities::cls);
+    if (!abCls) return;
+
+    jfieldID fid = jvm.getFieldID(abCls, fieldName, "Z");
+    if (fid)
+    {
+        env->SetBooleanField(abilities, fid, val);
+    }
+    env->DeleteLocalRef(abCls);
+}
+
+void Fly::onEnable()
+{
+    auto& jvm = JVM::instance();
+    JNIEnv* env = jvm.env();
+    if (!env) return;
+
+    jobject player = jvm.getPlayer();
+    if (!player) return;
+
+    jclass playerCls = jvm.findClass(Mappings::Cls::PlayerEntity);
+    if (!playerCls) return;
+
+    jmethodID getAbilities = jvm.getMethodID(playerCls,
+        Mappings::Player::getAbilities, "()Lnet/minecraft/class_1656;");
+    if (!getAbilities) { env->DeleteLocalRef(playerCls); return; }
+
+    jobject abilities = env->CallObjectMethod(player, getAbilities);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(playerCls); return; }
+    if (!abilities) { env->DeleteLocalRef(playerCls); return; }
+
+    setAbility(env, abilities, Mappings::Abilities::allowFlying, JNI_TRUE);
+    setAbility(env, abilities, Mappings::Abilities::flying, JNI_TRUE);
+
+    env->DeleteLocalRef(playerCls);
+    env->DeleteLocalRef(abilities);
+    LOG_INFO("Fly enabled");
+}
+
+void Fly::onDisable()
+{
+    auto& jvm = JVM::instance();
+    JNIEnv* env = jvm.env();
+    if (!env) return;
+
+    jobject player = jvm.getPlayer();
+    if (!player) return;
+
+    jclass playerCls = jvm.findClass(Mappings::Cls::PlayerEntity);
+    if (!playerCls) return;
+
+    jmethodID getAbilities = jvm.getMethodID(playerCls,
+        Mappings::Player::getAbilities, "()Lnet/minecraft/class_1656;");
+    if (!getAbilities) { env->DeleteLocalRef(playerCls); return; }
+
+    jobject abilities = env->CallObjectMethod(player, getAbilities);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(playerCls); return; }
+    if (!abilities) { env->DeleteLocalRef(playerCls); return; }
+
+    setAbility(env, abilities, Mappings::Abilities::flying, JNI_FALSE);
+
+    env->DeleteLocalRef(playerCls);
+    env->DeleteLocalRef(abilities);
+    LOG_INFO("Fly disabled");
+}
+
+void Fly::onTick()
+{
+    auto& jvm = JVM::instance();
+    JNIEnv* env = jvm.env();
+    if (!env) return;
+
+    jobject player = jvm.getPlayer();
+    if (!player) return;
+
+    // Re-assert flying every tick (game may reset it)
+    jclass playerCls = jvm.findClass(Mappings::Cls::PlayerEntity);
+    if (!playerCls) return;
+
+    jmethodID getAbilities = jvm.getMethodID(playerCls,
+        Mappings::Player::getAbilities, "()Lnet/minecraft/class_1656;");
+    if (!getAbilities) { env->DeleteLocalRef(playerCls); return; }
+
+    jobject abilities = env->CallObjectMethod(player, getAbilities);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(playerCls); return; }
+    if (!abilities) { env->DeleteLocalRef(playerCls); return; }
+
+    setAbility(env, abilities, Mappings::Abilities::flying, JNI_TRUE);
+    setAbility(env, abilities, Mappings::Abilities::allowFlying, JNI_TRUE);
+
+    // Anti-kick: every 20 ticks, send a slight downward position offset
+    m_tickCounter++;
+    if (getBool("AntiKick", true) && m_tickCounter >= 20)
+    {
+        m_tickCounter = 0;
+
+        // Get player position for the packet
+        jclass eCls = jvm.findClass(Mappings::Cls::Entity);
+        if (eCls)
+        {
+            jmethodID getX = jvm.getMethodID(eCls, Mappings::Entity::getX, "()D");
+            jmethodID getY = jvm.getMethodID(eCls, Mappings::Entity::getY, "()D");
+            jmethodID getZ = jvm.getMethodID(eCls, Mappings::Entity::getZ, "()D");
+
+            if (getX && getY && getZ)
+            {
+                double px = env->CallDoubleMethod(player, getX);
+                double py = env->CallDoubleMethod(player, getY);
+                double pz = env->CallDoubleMethod(player, getZ);
+
+                // Queue a position packet with slight downward offset
+                PacketManager::instance().sendPositionFull(
+                    px, py - 0.1, pz, 0.0f, 0.0f, true);
+            }
+            env->DeleteLocalRef(eCls);
+        }
+    }
+
+    env->DeleteLocalRef(playerCls);
+    env->DeleteLocalRef(abilities);
+}
+
+#pragma once
+#include "Module.h"
+
+class Fly : public Module
+{
+public:
+    Fly() : Module("Fly", "Creative-style flight", Category::Movement)
+    {
+        addFloat("Speed", 1.0f, 0.5f, 5.0f);
+        addBool("AntiKick", true);
+    }
+    void onEnable() override;
+    void onDisable() override;
+    void onTick() override;
+private:
+    int m_tickCounter = 0;
+};
+
+#include "FullBright.h"
+#include "../core/JVM.h"
+#include "../core/Mappings.h"
+#include "../utils/Logger.h"
+
+void FullBright::onEnable()
+{
+    auto& jvm = JVM::instance();
+    JNIEnv* env = jvm.env();
+    if (!env) return;
+
+    jobject mc = jvm.getMinecraft();
+    if (!mc) return;
+
+    jclass mcCls = jvm.findClass(Mappings::Cls::MinecraftClient);
+    if (!mcCls) return;
+
+    // Get options field
+    jfieldID optField = jvm.getFieldID(mcCls,
+        Mappings::MC::options, "Lnet/minecraft/class_315;");
+    if (!optField) { env->DeleteLocalRef(mcCls); return; }
+
+    jobject options = env->GetObjectField(mc, optField);
+    if (!options) { env->DeleteLocalRef(mcCls); return; }
+
+    // Get gamma option field
+    jclass optCls = jvm.findClass(Mappings::Options::cls);
+    if (!optCls) { env->DeleteLocalRef(mcCls); env->DeleteLocalRef(options); return; }
+
+    jfieldID gammaField = jvm.getFieldID(optCls,
+        Mappings::Options::gammaOption, "Lnet/minecraft/class_7172;");
+    if (!gammaField)
+    {
+        env->DeleteLocalRef(mcCls); env->DeleteLocalRef(options); env->DeleteLocalRef(optCls);
+        return;
+    }
+
+    jobject gammaOpt = env->GetObjectField(options, gammaField);
+    if (!gammaOpt)
+    {
+        env->DeleteLocalRef(mcCls); env->DeleteLocalRef(options); env->DeleteLocalRef(optCls);
+        return;
+    }
+
+    // Save original value
+    jclass soCls = jvm.findClass(Mappings::SimpleOption::cls);
+    if (soCls)
+    {
+        jmethodID getValue = jvm.getMethodID(soCls,
+            Mappings::SimpleOption::getValue, "()Ljava/lang/Object;");
+        if (getValue)
+        {
+            jobject val = env->CallObjectMethod(gammaOpt, getValue);
+            if (val && env->IsInstanceOf(val, env->FindClass("java/lang/Double")))
+            {
+                jclass doubleCls = env->FindClass("java/lang/Double");
+                jmethodID doubleValue = env->GetMethodID(doubleCls, "doubleValue", "()D");
+                m_originalGamma = env->CallDoubleMethod(val, doubleValue);
+                m_hasOriginal = true;
+                env->DeleteLocalRef(doubleCls);
+            }
+            if (val) env->DeleteLocalRef(val);
+        }
+    }
+
+    // Set gamma to 15.0
+    if (soCls)
+    {
+        jmethodID setValue = jvm.getMethodID(soCls,
+            Mappings::SimpleOption::setValue, "(Ljava/lang/Object;)V");
+        if (setValue)
+        {
+            jclass doubleCls = env->FindClass("java/lang/Double");
+            jmethodID valueOf = env->GetStaticMethodID(doubleCls, "valueOf", "(D)Ljava/lang/Double;");
+            jobject newGamma = env->CallStaticObjectMethod(doubleCls, valueOf, 15.0);
+            env->CallVoidMethod(gammaOpt, setValue, newGamma);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->DeleteLocalRef(newGamma);
+            env->DeleteLocalRef(doubleCls);
+        }
+    }
+
+    env->DeleteLocalRef(mcCls);
+    env->DeleteLocalRef(options);
+    env->DeleteLocalRef(optCls);
+    if (soCls) env->DeleteLocalRef(soCls);
+    env->DeleteLocalRef(gammaOpt);
+}
+
+void FullBright::onDisable()
+{
+    if (!m_hasOriginal) return;
+
+    auto& jvm = JVM::instance();
+    JNIEnv* env = jvm.env();
+    if (!env) return;
+
+    jobject mc = jvm.getMinecraft();
+    if (!mc) return;
+
+    jclass mcCls = jvm.findClass(Mappings::Cls::MinecraftClient);
+    if (!mcCls) return;
+
+    jfieldID optField = jvm.getFieldID(mcCls,
+        Mappings::MC::options, "Lnet/minecraft/class_315;");
+    if (!optField) { env->DeleteLocalRef(mcCls); return; }
+
+    jobject options = env->GetObjectField(mc, optField);
+    if (!options) { env->DeleteLocalRef(mcCls); return; }
+
+    jclass optCls = jvm.findClass(Mappings::Options::cls);
+    if (!optCls) { env->DeleteLocalRef(mcCls); env->DeleteLocalRef(options); return; }
+
+    jfieldID gammaField = jvm.getFieldID(optCls,
+        Mappings::Options::gammaOption, "Lnet/minecraft/class_7172;");
+    if (!gammaField)
+    {
+        env->DeleteLocalRef(mcCls); env->DeleteLocalRef(options); env->DeleteLocalRef(optCls);
+        return;
+    }
+
+    jobject gammaOpt = env->GetObjectField(options, gammaField);
+    if (!gammaOpt)
+    {
+        env->DeleteLocalRef(mcCls); env->DeleteLocalRef(options); env->DeleteLocalRef(optCls);
+        return;
+    }
+
+    jclass soCls = jvm.findClass(Mappings::SimpleOption::cls);
+    if (soCls)
+    {
+        jmethodID setValue = jvm.getMethodID(soCls,
+            Mappings::SimpleOption::setValue, "(Ljava/lang/Object;)V");
+        if (setValue)
+        {
+            jclass doubleCls = env->FindClass("java/lang/Double");
+            jmethodID valueOf = env->GetStaticMethodID(doubleCls, "valueOf", "(D)Ljava/lang/Double;");
+            jobject orig = env->CallStaticObjectMethod(doubleCls, valueOf, m_originalGamma);
+            env->CallVoidMethod(gammaOpt, setValue, orig);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->DeleteLocalRef(orig);
+            env->DeleteLocalRef(doubleCls);
+        }
+        env->DeleteLocalRef(soCls);
+    }
+
+    env->DeleteLocalRef(mcCls);
+    env->DeleteLocalRef(options);
+    env->DeleteLocalRef(optCls);
+    env->DeleteLocalRef(gammaOpt);
+    m_hasOriginal = false;
+}
+
+#pragma once
+#include "Module.h"
+
+class FullBright : public Module
+{
+public:
+    FullBright() : Module("FullBright", "Maximum brightness", Category::Render)
+    {
+    }
+    void onEnable() override;
+    void onDisable() override;
+private:
+    double m_originalGamma = 0.5;
+    bool   m_hasOriginal   = false;
+};
+
+#include "KillAura.h"
+#include "../core/JVM.h"
+#include "../core/Mappings.h"
+#include "../packet/PacketManager.h"
+#include "../utils/Logger.h"
+#include <cmath>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+void KillAura::onTick()
+{
+    if (m_delayCounter > 0)
+    {
+        m_delayCounter--;
+        return;
+    }
+
+    auto& jvm = JVM::instance();
+    JNIEnv* env = jvm.env();
+    if (!env) return;
+
+    jobject player = jvm.getPlayer();
+    if (!player) return;
+
+    jobject world = jvm.getWorld();
+    if (!world) return;
+
+    // Use a local frame for clean ref management
+    if (env->PushLocalFrame(32) != 0)
+    {
+        LOG_WARN("KillAura: PushLocalFrame failed");
+        return;
+    }
+
+    // ── Get player position ──────────────────────────────────
+    jclass entityCls = jvm.findClass(Mappings::Cls::Entity);
+    if (!entityCls) { env->PopLocalFrame(nullptr); return; }
+
+    jmethodID getX = jvm.getMethodID(entityCls, Mappings::Entity::getX, "()D");
+    jmethodID getY = jvm.getMethodID(entityCls, Mappings::Entity::getY, "()D");
+    jmethodID getZ = jvm.getMethodID(entityCls, Mappings::Entity::getZ, "()D");
+    jmethodID getId = jvm.getMethodID(entityCls, Mappings::Entity::getId, "()I");
+    jmethodID isAlive = jvm.getMethodID(entityCls, Mappings::Entity::isAlive, "()Z");
+
+    if (!getX || !getY || !getZ || !getId || !isAlive)
+    {
+        env->PopLocalFrame(nullptr);
+        return;
+    }
+
+    double px = env->CallDoubleMethod(player, getX);
+    double py = env->CallDoubleMethod(player, getY) + 1.62; // eye height
+    double pz = env->CallDoubleMethod(player, getZ);
+    int playerId = env->CallIntMethod(player, getId);
+
+    // ── Get entity iterable from world ───────────────────────
+    jclass worldCls = jvm.findClass(Mappings::Cls::ClientWorld);
+    if (!worldCls)
+    {
+        worldCls = jvm.findClass("net/minecraft/class_1937"); // World
+        if (!worldCls) { env->PopLocalFrame(nullptr); return; }
+    }
+
+    jobject iterable = nullptr;
+
+    // Try method_18112 first
+    jmethodID getEntities = jvm.getMethodID(worldCls,
+        Mappings::World::getEntities, "()Ljava/lang/Iterable;");
+    if (getEntities)
+    {
+        iterable = env->CallObjectMethod(world, getEntities);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); iterable = nullptr; }
+    }
+
+    // Fallback: method_17940
+    if (!iterable)
+    {
+        getEntities = jvm.getMethodID(worldCls,
+            Mappings::World::getRawEntities, "()Ljava/lang/Iterable;");
+        if (getEntities)
+        {
+            iterable = env->CallObjectMethod(world, getEntities);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); iterable = nullptr; }
+        }
+    }
+
+    if (!iterable)
+    {
+        LOG_WARN("KillAura: could not obtain entity list from world");
+        env->PopLocalFrame(nullptr);
+        return;
+    }
+
+    // ── Iterate entities ─────────────────────────────────────
+    jclass iterCls = env->FindClass("java/util/Iterator");
+    jclass itblCls = env->FindClass("java/lang/Iterable");
+    jmethodID iterMid = env->GetMethodID(itblCls, "iterator", "()Ljava/util/Iterator;");
+    jmethodID hasNext = env->GetMethodID(iterCls, "hasNext", "()Z");
+    jmethodID nextMid = env->GetMethodID(iterCls, "next", "()Ljava/lang/Object;");
+
+    jobject iterator = env->CallObjectMethod(iterable, iterMid);
+    if (!iterator)
+    {
+        env->PopLocalFrame(nullptr);
+        return;
+    }
+
+    jclass livingCls = jvm.findClass(Mappings::Cls::LivingEntity);
+
+    jobject bestTarget = nullptr;
+    double bestDist = 1e9;
+
+    while (env->CallBooleanMethod(iterator, hasNext))
+    {
+        if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
+
+        jobject entity = env->CallObjectMethod(iterator, nextMid);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+        if (!entity) continue;
+
+        // Skip self
+        if (env->IsSameObject(entity, player))
+        {
+            env->DeleteLocalRef(entity);
+            continue;
+        }
+
+        // Skip dead
+        if (!env->CallBooleanMethod(entity, isAlive))
+        {
+            env->DeleteLocalRef(entity);
+            continue;
+        }
+
+        // Skip non-living (if we can check)
+        if (livingCls && !env->IsInstanceOf(entity, livingCls))
+        {
+            env->DeleteLocalRef(entity);
+            continue;
+        }
+
+        // Distance check
+        double ex = env->CallDoubleMethod(entity, getX);
+        double ey = env->CallDoubleMethod(entity, getY);
+        double ez = env->CallDoubleMethod(entity, getZ);
+
+        double dx = ex - px;
+        double dy = ey - py;
+        double dz = ez - pz;
+        double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        float range = getFloat("Range", 4.5f);
+        if (dist <= range && dist < bestDist)
+        {
+            bestDist = dist;
+            if (bestTarget) env->DeleteLocalRef(bestTarget);
+            bestTarget = env->NewLocalRef(entity);
+        }
+
+        env->DeleteLocalRef(entity);
+    }
+
+    // ── Attack best target ───────────────────────────────────
+    if (bestTarget)
+    {
+        // Get target position for rotation
+        double ex = env->CallDoubleMethod(bestTarget, getX);
+        double ey = env->CallDoubleMethod(bestTarget, getY);
+        double ez = env->CallDoubleMethod(bestTarget, getZ);
+
+        double dx = ex - px;
+        double dy = (ey + 1.0) - py; // approximate target center
+        double dz = ez - pz;
+
+        double distXZ = std::sqrt(dx * dx + dz * dz);
+        float yaw = (float)(std::atan2(-dx, dz) * 180.0 / M_PI);
+        float pitch = (float)(-std::atan2(dy, distXZ) * 180.0 / M_PI);
+
+        // Clamp pitch
+        if (pitch > 90.0f) pitch = 90.0f;
+        if (pitch < -90.0f) pitch = -90.0f;
+
+        // Set player rotation via fields
+        jfieldID yawF = jvm.getFieldID(entityCls, Mappings::Entity::yawField, "F");
+        jfieldID pitchF = jvm.getFieldID(entityCls, Mappings::Entity::pitchField, "F");
+        jfieldID prevYawF = jvm.getFieldID(entityCls, Mappings::Entity::prevYaw, "F");
+        jfieldID prevPitchF = jvm.getFieldID(entityCls, Mappings::Entity::prevPitch, "F");
+
+        if (yawF)   env->SetFloatField(player, yawF, yaw);
+        if (pitchF) env->SetFloatField(player, pitchF, pitch);
+        if (prevYawF)   env->SetFloatField(player, prevYawF, yaw);
+        if (prevPitchF) env->SetFloatField(player, prevPitchF, pitch);
+
+        // Attack via player.attack(Entity)
+        jclass playerCls = jvm.findClass(Mappings::Cls::PlayerEntity);
+        if (playerCls)
+        {
+            jmethodID attackMid = jvm.getMethodID(playerCls,
+                Mappings::Player::attack, "(Lnet/minecraft/class_1297;)V");
+            if (attackMid)
+            {
+                env->CallVoidMethod(player, attackMid, bestTarget);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+            env->DeleteLocalRef(playerCls);
+        }
+
+        // Reset delay
+        m_delayCounter = getInt("Delay", 2);
+
+        env->DeleteLocalRef(bestTarget);
+    }
+
+    env->PopLocalFrame(nullptr);
+}
+
+#pragma once
+#include "Module.h"
+
+class KillAura : public Module
+{
+public:
+    KillAura() : Module("KillAura", "Auto-attacks nearby entities", Category::Combat)
+    {
+        addFloat("Range", 4.5f, 1.0f, 8.0f);
+        addInt("Delay", 2, 0, 20);
+        addBool("ThroughWalls", false);
+    }
+    void onTick() override;
+private:
+    int m_delayCounter = 0;
+};
